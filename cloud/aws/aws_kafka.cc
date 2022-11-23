@@ -12,6 +12,7 @@
 #include "rocksdb/cloud/cloud_env_options.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/status.h"
+#include "rocksdb/system_clock.h"
 #include "util/coding.h"
 #include "util/string_util.h"
 
@@ -62,6 +63,8 @@ const std::chrono::microseconds KafkaWritableFile::kFlushTimeout =
 
 Status KafkaWritableFile::ProduceRaw(const std::string& operation_name,
                                      const Slice& message) {
+  uint64_t start_time = env_->NowMicros();
+
   if (!status_.ok()) {
     return status_;
   }
@@ -72,8 +75,13 @@ Status KafkaWritableFile::ProduceRaw(const std::string& operation_name,
       RdKafka::Producer::RK_MSG_COPY /* Copy payload */, (void*)message.data(),
       message.size(), &fname_ /* Partitioning key */, nullptr);
 
+  uint64_t stop_time = env_->NowMicros();
+
+  Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
+      "[kafka] produce latency %ld", stop_time - start_time);
+
   if (resp == RdKafka::ERR_NO_ERROR) {
-    Log(InfoLogLevel::DEBUG_LEVEL, env_->GetLogger(),
+    Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
         "[kafka] WritableFile %s file %s %ld", fname_.c_str(),
         operation_name.c_str(), message.size());
     return Status::OK();
@@ -103,6 +111,8 @@ Status KafkaWritableFile::Append(const Slice& data) {
   CloudLogControllerImpl::SerializeLogRecordAppend(
       fname_, data, current_offset_, &serialized_data);
 
+  Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
+      "[kafka] Append called!!!!!");
   return ProduceRaw("Append", serialized_data);
 }
 
@@ -129,24 +139,24 @@ Status KafkaWritableFile::Flush() {
   while (status_.ok() && !(done = (producer_->outq_len() == 0)) &&
          !(timeout = (std::chrono::microseconds(env_->NowMicros()) - start >
                       kFlushTimeout))) {
-    Log(InfoLogLevel::DEBUG_LEVEL, env_->GetLogger(),
+    Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
         "[kafka] WritableFile src %s "
         "Waiting on flush: Output queue length: %d",
         fname_.c_str(), producer_->outq_len());
 
-    producer_->poll(500);
+    producer_->poll(1);
   }
 
   if (done) {
-    Log(InfoLogLevel::DEBUG_LEVEL, env_->GetLogger(),
+    Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
         "[kafka] WritableFile src %s Flushed", fname_.c_str());
   } else if (timeout) {
-    Log(InfoLogLevel::DEBUG_LEVEL, env_->GetLogger(),
+    Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
         "[kafka] WritableFile src %s Flushing timed out after %" PRId64 "us",
         fname_.c_str(), kFlushTimeout.count());
     status_ = Status::TimedOut();
   } else {
-    Log(InfoLogLevel::DEBUG_LEVEL, env_->GetLogger(),
+    Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
         "[kafka] WritableFile src %s Flush interrupted", fname_.c_str());
   }
 
@@ -162,6 +172,50 @@ Status KafkaWritableFile::LogDelete() {
 
   return ProduceRaw("Delete", serialized_data);
 }
+
+/* event callback */
+class ExampleEventCb : public RdKafka::EventCb {
+ public:
+  ExampleEventCb() {}
+  ExampleEventCb(CloudEnv* env) : env_(env) {}
+  void event_cb(RdKafka::Event& event) {
+    switch (event.type()) {
+      case RdKafka::Event::EVENT_ERROR:
+        if (event.fatal()) {
+          Log(InfoLogLevel::FATAL_LEVEL, env_->GetLogger(),
+              "[kafka] FATAL: %s,%s", RdKafka::err2str(event.err()).c_str(),
+              event.str().c_str());
+        }
+        break;
+
+      case RdKafka::Event::EVENT_STATS:
+        Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(), "[kafka] Stats: %s",
+            event.str().c_str());
+        break;
+
+      case RdKafka::Event::EVENT_LOG:
+        Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
+            "[kafka] LOG-%i-%s: %s", event.severity(), event.fac().c_str(),
+            event.str().c_str());
+        break;
+
+      case RdKafka::Event::EVENT_THROTTLE:
+        Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
+            "[kafka] THROTTLED: %d ms by %s id %d", event.throttle_time(),
+            event.broker_name().c_str(), (int)event.broker_id());
+        break;
+
+      default:
+        Log(InfoLogLevel::INFO_LEVEL, env_->GetLogger(),
+            "[kafka] EVENT %i (%s): %s", event.type(),
+            RdKafka::err2str(event.err()).c_str(), event.str().c_str());
+        break;
+    }
+  }
+
+ private:
+  CloudEnv* env_;
+};
 
 /***************************************************/
 /*                 KafkaController                 */
@@ -203,7 +257,6 @@ class KafkaController : public CloudLogControllerImpl {
   Status PrepareOptions(const ConfigOptions& options) override;
 
  protected:
-
  private:
   Status InitializePartitions();
 
@@ -216,6 +269,7 @@ class KafkaController : public CloudLogControllerImpl {
   std::shared_ptr<RdKafka::Queue> consuming_queue_;
 
   std::vector<std::shared_ptr<RdKafka::TopicPartition>> partitions_;
+  std::shared_ptr<ExampleEventCb> event_cb_;
 };
 
 Status KafkaController::PrepareOptions(const ConfigOptions& options) {
@@ -240,6 +294,17 @@ Status KafkaController::PrepareOptions(const ConfigOptions& options) {
           "Kafka conf set error: %s", s.ToString().c_str());
       return s;
     }
+  }
+
+  event_cb_ = std::make_shared<ExampleEventCb>(env);
+  if (conf->set("event_cb", event_cb_.get(), conf_errstr) !=
+      RdKafka::Conf::CONF_OK) {
+    Status s = Status::InvalidArgument(
+        "Failed adding specified conf to Kafka conf", conf_errstr.c_str());
+
+    Log(InfoLogLevel::ERROR_LEVEL, env->GetLogger(),
+        "Kafka conf set error: %s ", s.ToString().c_str());
+    return s;
   }
 
   producer_.reset(RdKafka::Producer::create(conf.get(), producer_errstr));
