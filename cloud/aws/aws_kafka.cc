@@ -134,7 +134,7 @@ Status KafkaWritableFile::Flush() {
         "Waiting on flush: Output queue length: %d",
         fname_.c_str(), producer_->outq_len());
 
-    producer_->poll(500);
+    producer_->poll(1);
   }
 
   if (done) {
