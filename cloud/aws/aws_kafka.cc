@@ -203,7 +203,6 @@ class KafkaController : public CloudLogControllerImpl {
   Status PrepareOptions(const ConfigOptions& options) override;
 
  protected:
-
  private:
   Status InitializePartitions();
 
@@ -337,6 +336,9 @@ Status KafkaController::TailStream() {
         consumer_->poll(50);
         break;
       }
+      case RdKafka::ERR__TIMED_OUT:
+        // Timeout event - not an error, simply no messages available
+        break;
       default: {
         lastErrorStatus =
             Status::IOError(consumer_topic_->name().c_str(),
